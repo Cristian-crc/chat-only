@@ -1,20 +1,17 @@
 {
-  "name": "gerges-chat-server",
+  "name": "chat-server",
   "version": "1.0.0",
-  "description": "WebSocket server for Gerges Chat and Friends System",
+  "description": "Servidor de chat WebSocket para Gerges Online",
   "main": "chat-server.js",
   "scripts": {
     "start": "node chat-server.js",
     "dev": "nodemon chat-server.js"
   },
   "dependencies": {
-    "ws": "^8.14.2",
-    "mysql2": "^3.6.3"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "ws": "^8.16.0",
+    "pg": "^8.11.3"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   }
 }
