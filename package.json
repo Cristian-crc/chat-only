@@ -5,7 +5,8 @@
   "main": "chat-server.js",
   "scripts": {
     "start": "node chat-server.js",
-    "dev": "nodemon chat-server.js"
+    "dev": "nodemon chat-server.js",
+    "test": "echo \"No tests specified\" && exit 0"
   },
   "dependencies": {
     "ws": "^8.16.0",
