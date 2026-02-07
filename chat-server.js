@@ -1,29 +1,81 @@
 const WebSocket = require('ws');
 const http = require('http');
 const url = require('url');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg'); // Cambiar a PostgreSQL
 
 // Configuración
 const PORT = process.env.PORT || 10001;
-const ALLOWED_ORIGINS = [
-    'https://gerges-online.xo.je',
-    'http://localhost:3000',
-    'http://localhost'
-];
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS ? 
+    process.env.ALLOWED_ORIGINS.split(',') : 
+    ['https://gerges-online.xo.je', 'http://localhost:3000', 'http://localhost'];
 
-// Conexión a la base de datos
-const dbPool = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASS,
-    database: process.env.DB_NAME,
-    port: process.env.DB_PORT,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+// Conexión a PostgreSQL en Render
+const dbPool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 10, // Máximo de conexiones
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000,
 });
 
-// Almacenamiento en memoria
+// Verificar conexión a la base de datos
+dbPool.query('SELECT NOW()', (err) => {
+    if (err) {
+        console.error('❌ Error conectando a PostgreSQL:', err.message);
+    } else {
+        console.log('✅ Conectado a PostgreSQL en Render');
+    }
+});
+
+// Crear tablas si no existen
+async function initDatabase() {
+    try {
+        // Tabla de mensajes
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id SERIAL PRIMARY KEY,
+                sender_id INTEGER NOT NULL,
+                receiver_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_receiver (receiver_id, is_read),
+                INDEX idx_sender (sender_id, created_at)
+            )
+        `);
+
+        // Tabla de notificaciones
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS chat_notifications (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                type VARCHAR(50) NOT NULL,
+                from_user_id INTEGER,
+                message TEXT,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_notif (user_id, is_read, created_at)
+            )
+        `);
+
+        // Tabla de usuarios online (cache)
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS online_users_cache (
+                user_id INTEGER PRIMARY KEY,
+                username VARCHAR(100),
+                socket_count INTEGER DEFAULT 1,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_last_seen (last_seen)
+            )
+        `);
+
+        console.log('✅ Tablas de chat creadas/verificadas');
+    } catch (error) {
+        console.error('❌ Error inicializando base de datos:', error);
+    }
+}
+
+// Almacenamiento en memoria para conexiones activas
 const onlineUsers = new Map(); // userId -> { ws, username, ... }
 const userSockets = new Map(); // userId -> Set of WebSockets
 
@@ -100,7 +152,7 @@ wss.on('connection', async (ws, req) => {
     
     console.log(`🔌 Usuario conectado: ${username} (${userId})`);
     
-    // Registrar usuario
+    // Registrar usuario en memoria
     onlineUsers.set(userId, { ws, username, userId });
     
     // Agregar socket a la lista
@@ -109,8 +161,8 @@ wss.on('connection', async (ws, req) => {
     }
     userSockets.get(userId).add(ws);
     
-    // Actualizar estado en la base de datos
-    await updateUserOnlineStatus(userId, true);
+    // Actualizar en cache de PostgreSQL
+    await updateUserOnlineCache(userId, username);
     
     // Enviar confirmación
     ws.send(JSON.stringify({
@@ -118,9 +170,6 @@ wss.on('connection', async (ws, req) => {
         message: 'Conectado al servidor de chat',
         user: { id: userId, username: username }
     }));
-    
-    // Notificar a amigos que están en línea
-    await notifyFriendsOnline(userId, username);
     
     // Enviar notificaciones pendientes
     await sendPendingNotifications(userId, ws);
@@ -145,10 +194,7 @@ wss.on('connection', async (ws, req) => {
             if (userSockets.get(userId).size === 0) {
                 userSockets.delete(userId);
                 onlineUsers.delete(userId);
-                await updateUserOnlineStatus(userId, false);
-                
-                // Notificar a amigos que está desconectado
-                await notifyFriendsOffline(userId);
+                await removeUserFromCache(userId);
             }
         }
     });
@@ -183,6 +229,11 @@ async function handleMessage(userId, username, message, ws) {
         case 'ping':
             ws.send(JSON.stringify({ type: 'pong' }));
             break;
+            
+        case 'friend_added':
+            // Notificar a ambos usuarios que ahora son amigos
+            await handleFriendAdded(userId, message);
+            break;
     }
 }
 
@@ -190,18 +241,18 @@ async function handlePrivateMessage(senderId, senderName, message) {
     const { to_user_id, message: messageText, timestamp } = message;
     
     try {
-        // Guardar en la base de datos
-        const [result] = await dbPool.execute(
-            'INSERT INTO chat_messages (sender_id, receiver_id, message) VALUES (?, ?, ?)',
+        // Guardar en PostgreSQL
+        const result = await dbPool.query(
+            'INSERT INTO chat_messages (sender_id, receiver_id, message) VALUES ($1, $2, $3) RETURNING id',
             [senderId, to_user_id, messageText]
         );
         
-        const messageId = result.insertId;
+        const messageId = result.rows[0].id;
         
         // Crear notificación
-        await dbPool.execute(
-            'INSERT INTO chat_notifications (user_id, type, from_user_id, message) VALUES (?, "message", ?, ?)',
-            [to_user_id, senderId, messageText.substring(0, 100)]
+        await dbPool.query(
+            'INSERT INTO chat_notifications (user_id, type, from_user_id, message) VALUES ($1, $2, $3, $4)',
+            [to_user_id, 'message', senderId, messageText.substring(0, 100)]
         );
         
         // Enviar al receptor si está en línea
@@ -227,10 +278,10 @@ async function handleFriendRequest(senderId, senderName, message) {
     const { to_user_id } = message;
     
     try {
-        // Crear notificación en la base de datos
-        await dbPool.execute(
-            'INSERT INTO chat_notifications (user_id, type, from_user_id) VALUES (?, "friend_request", ?)',
-            [to_user_id, senderId]
+        // Crear notificación en PostgreSQL
+        await dbPool.query(
+            'INSERT INTO chat_notifications (user_id, type, from_user_id) VALUES ($1, $2, $3)',
+            [to_user_id, 'friend_request', senderId]
         );
         
         // Enviar notificación al receptor si está en línea
@@ -254,17 +305,11 @@ async function handleFriendRequestResponse(userId, username, message) {
     const { request_id, from_user_id, status } = message;
     
     try {
-        // Actualizar estado en la base de datos
-        await dbPool.execute(
-            'UPDATE friends SET status = ?, updated_at = NOW() WHERE user_id = ? AND friend_id = ?',
-            [status, from_user_id, userId]
-        );
-        
         // Crear notificación si es aceptada
         if (status === 'accepted') {
-            await dbPool.execute(
-                'INSERT INTO chat_notifications (user_id, type, from_user_id) VALUES (?, "friend_accepted", ?)',
-                [from_user_id, userId]
+            await dbPool.query(
+                'INSERT INTO chat_notifications (user_id, type, from_user_id) VALUES ($1, $2, $3)',
+                [from_user_id, 'friend_accepted', userId]
             );
         }
         
@@ -284,6 +329,40 @@ async function handleFriendRequestResponse(userId, username, message) {
         
     } catch (error) {
         console.error('Error procesando respuesta de solicitud:', error);
+    }
+}
+
+async function handleFriendAdded(userId, message) {
+    const { friend_id, friend_username } = message;
+    
+    try {
+        // Notificar a ambos usuarios que ahora son amigos
+        const notifications = [];
+        
+        // Notificar al usuario que inició la solicitud
+        if (onlineUsers.has(userId)) {
+            const user = onlineUsers.get(userId);
+            user.ws.send(JSON.stringify({
+                type: 'friend_added',
+                friend_id: friend_id,
+                friend_username: friend_username,
+                timestamp: Date.now()
+            }));
+        }
+        
+        // Notificar al amigo agregado
+        if (onlineUsers.has(friend_id)) {
+            const friend = onlineUsers.get(friend_id);
+            friend.ws.send(JSON.stringify({
+                type: 'friend_added',
+                friend_id: userId,
+                friend_username: username || 'Usuario',
+                timestamp: Date.now()
+            }));
+        }
+        
+    } catch (error) {
+        console.error('Error notificando nuevo amigo:', error);
     }
 }
 
@@ -307,9 +386,9 @@ async function handleReadReceipt(userId, message) {
     const { message_id, from_user_id } = message;
     
     try {
-        // Marcar mensaje como leído en la base de datos
-        await dbPool.execute(
-            'UPDATE chat_messages SET is_read = TRUE WHERE id = ? AND receiver_id = ?',
+        // Marcar mensaje como leído en PostgreSQL
+        await dbPool.query(
+            'UPDATE chat_messages SET is_read = TRUE WHERE id = $1 AND receiver_id = $2',
             [message_id, userId]
         );
         
@@ -329,160 +408,103 @@ async function handleReadReceipt(userId, message) {
     }
 }
 
-async function updateUserOnlineStatus(userId, isOnline) {
+async function updateUserOnlineCache(userId, username) {
     try {
-        await dbPool.execute(
-            'UPDATE users SET is_online = ?, last_seen = NOW() WHERE id = ?',
-            [isOnline ? 1 : 0, userId]
-        );
+        // Usar UPSERT (INSERT ... ON CONFLICT ...)
+        await dbPool.query(`
+            INSERT INTO online_users_cache (user_id, username, socket_count, last_seen) 
+            VALUES ($1, $2, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id) 
+            DO UPDATE SET 
+                socket_count = online_users_cache.socket_count + 1,
+                last_seen = CURRENT_TIMESTAMP,
+                username = EXCLUDED.username
+        `, [userId, username]);
     } catch (error) {
-        console.error('Error actualizando estado:', error);
+        console.error('Error actualizando cache de usuario:', error);
     }
 }
 
-async function notifyFriendsOnline(userId, username) {
+async function removeUserFromCache(userId) {
     try {
-        // Obtener amigos
-        const [friends] = await dbPool.execute(
-            `SELECT u.id 
-             FROM friends f 
-             JOIN users u ON (f.user_id = ? AND f.friend_id = u.id) 
-                OR (f.friend_id = ? AND f.user_id = u.id) 
-             WHERE f.status = 'accepted' AND u.is_online = 1`,
-            [userId, userId]
+        await dbPool.query(
+            'DELETE FROM online_users_cache WHERE user_id = $1',
+            [userId]
         );
-        
-        // Notificar a cada amigo en línea
-        friends.forEach(friend => {
-            if (onlineUsers.has(friend.id)) {
-                const friendWs = onlineUsers.get(friend.id).ws;
-                friendWs.send(JSON.stringify({
-                    type: 'friend_online',
-                    user_id: userId,
-                    username: username,
-                    timestamp: Date.now()
-                }));
-            }
-        });
-        
     } catch (error) {
-        console.error('Error notificando amigos:', error);
-    }
-}
-
-async function notifyFriendsOffline(userId) {
-    try {
-        // Obtener amigos
-        const [friends] = await dbPool.execute(
-            `SELECT u.id 
-             FROM friends f 
-             JOIN users u ON (f.user_id = ? AND f.friend_id = u.id) 
-                OR (f.friend_id = ? AND f.user_id = u.id) 
-             WHERE f.status = 'accepted' AND u.is_online = 1`,
-            [userId, userId]
-        );
-        
-        // Notificar a cada amigo en línea
-        friends.forEach(friend => {
-            if (onlineUsers.has(friend.id)) {
-                const friendWs = onlineUsers.get(friend.id).ws;
-                friendWs.send(JSON.stringify({
-                    type: 'friend_offline',
-                    user_id: userId,
-                    timestamp: Date.now()
-                }));
-            }
-        });
-        
-    } catch (error) {
-        console.error('Error notificando amigos:', error);
+        console.error('Error removiendo usuario de cache:', error);
     }
 }
 
 async function sendPendingNotifications(userId, ws) {
     try {
-        // Obtener mensajes no leídos
-        const [unreadMessages] = await dbPool.execute(
-            `SELECT cm.*, u.username as sender_username
-             FROM chat_messages cm
-             JOIN users u ON cm.sender_id = u.id
-             WHERE cm.receiver_id = ? AND cm.is_read = FALSE
-             ORDER BY cm.created_at DESC
-             LIMIT 10`,
-            [userId]
-        );
-        
         // Obtener notificaciones no leídas
-        const [notifications] = await dbPool.execute(
-            `SELECT cn.*, u.username as from_username
-             FROM chat_notifications cn
-             LEFT JOIN users u ON cn.from_user_id = u.id
-             WHERE cn.user_id = ? AND cn.is_read = FALSE
-             ORDER BY cn.created_at DESC
+        const result = await dbPool.query(
+            `SELECT id, type, from_user_id, message, created_at 
+             FROM chat_notifications 
+             WHERE user_id = $1 AND is_read = FALSE 
+             ORDER BY created_at DESC 
              LIMIT 10`,
             [userId]
         );
-        
-        // Enviar mensajes no leídos
-        unreadMessages.forEach(msg => {
-            ws.send(JSON.stringify({
-                type: 'private_message',
-                from_user_id: msg.sender_id,
-                from_username: msg.sender_username,
-                to_user_id: userId,
-                message: msg.message,
-                message_id: msg.id,
-                timestamp: new Date(msg.created_at).getTime()
-            }));
-        });
         
         // Enviar notificaciones
-        notifications.forEach(notif => {
+        result.rows.forEach(notif => {
             ws.send(JSON.stringify({
                 type: notif.type,
                 notification_id: notif.id,
                 from_user_id: notif.from_user_id,
-                from_username: notif.from_username,
                 message: notif.message,
                 timestamp: new Date(notif.created_at).getTime()
             }));
         });
+        
+        // Marcar como leídas
+        if (result.rows.length > 0) {
+            await dbPool.query(
+                'UPDATE chat_notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE',
+                [userId]
+            );
+        }
         
     } catch (error) {
         console.error('Error enviando notificaciones pendientes:', error);
     }
 }
 
+// Inicializar base de datos
+initDatabase();
+
 server.listen(PORT, () => {
-    console.log(`💬 Servidor de chat iniciado en el puerto ${PORT}`);
+    console.log(`💬 Servidor de chat PostgreSQL iniciado en el puerto ${PORT}`);
     console.log(`🔗 URL del servidor: ws://localhost:${PORT}/chat-ws`);
     console.log(`🏥 Endpoint de salud: http://localhost:${PORT}/health`);
 });
 
-// Limpieza periódica
-setInterval(() => {
+// Limpieza periódica de usuarios inactivos
+setInterval(async () => {
     console.log(`👥 Usuarios en línea: ${onlineUsers.size}`);
-}, 60000);
+    
+    try {
+        // Limpiar usuarios que no han estado activos en 10 minutos
+        await dbPool.query(
+            `DELETE FROM online_users_cache 
+             WHERE last_seen < CURRENT_TIMESTAMP - INTERVAL '10 minutes'`
+        );
+    } catch (error) {
+        console.error('Error limpiando cache:', error);
+    }
+}, 60000); // Cada minuto
 
 // Manejo de cierre
 process.on('SIGINT', async () => {
     console.log('\n👋 Apagando servidor de chat...');
-    
-    // Marcar todos los usuarios como desconectados
-    for (const userId of onlineUsers.keys()) {
-        await updateUserOnlineStatus(userId, false);
-    }
-    
+    await dbPool.end();
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
     console.log('\n👋 Apagando servidor de chat...');
-    
-    // Marcar todos los usuarios como desconectados
-    for (const userId of onlineUsers.keys()) {
-        await updateUserOnlineStatus(userId, false);
-    }
-    
+    await dbPool.end();
     process.exit(0);
 });
