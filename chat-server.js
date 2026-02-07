@@ -46,6 +46,7 @@ wss.on('connection', async (ws, req) => {
     const query = url.parse(req.url, true).query;
     const userId = parseInt(query.user);
     const username = decodeURIComponent(query.username || 'Usuario');
+    const token = query.token || '';
     
     if (!userId) {
         ws.close(1008, 'ID de usuario requerido');
@@ -73,6 +74,9 @@ wss.on('connection', async (ws, req) => {
         user: { id: userId, username: username }
     }));
     
+    // Notificar a amigos que están en línea
+    await notifyFriendsOnline(userId, username);
+    
     // Enviar notificaciones pendientes
     await sendPendingNotifications(userId, ws);
     
@@ -97,6 +101,9 @@ wss.on('connection', async (ws, req) => {
                 userSockets.delete(userId);
                 onlineUsers.delete(userId);
                 await updateUserOnlineStatus(userId, false);
+                
+                // Notificar a amigos que está desconectado
+                await notifyFriendsOffline(userId);
             }
         }
     });
@@ -120,6 +127,14 @@ async function handleMessage(userId, username, message, ws) {
             await handleFriendRequestResponse(userId, username, message);
             break;
             
+        case 'typing':
+            await handleTypingNotification(userId, username, message);
+            break;
+            
+        case 'read_receipt':
+            await handleReadReceipt(userId, message);
+            break;
+            
         case 'ping':
             ws.send(JSON.stringify({ type: 'pong' }));
             break;
@@ -129,14 +144,20 @@ async function handleMessage(userId, username, message, ws) {
 async function handlePrivateMessage(senderId, senderName, message) {
     const { to_user_id, message: messageText, timestamp } = message;
     
-    // Guardar en la base de datos
     try {
+        // Guardar en la base de datos
         const [result] = await dbPool.execute(
             'INSERT INTO chat_messages (sender_id, receiver_id, message) VALUES (?, ?, ?)',
             [senderId, to_user_id, messageText]
         );
         
         const messageId = result.insertId;
+        
+        // Crear notificación
+        await dbPool.execute(
+            'INSERT INTO chat_notifications (user_id, type, from_user_id, message) VALUES (?, "message", ?, ?)',
+            [to_user_id, senderId, messageText.substring(0, 100)]
+        );
         
         // Enviar al receptor si está en línea
         if (onlineUsers.has(to_user_id)) {
@@ -160,33 +181,106 @@ async function handlePrivateMessage(senderId, senderName, message) {
 async function handleFriendRequest(senderId, senderName, message) {
     const { to_user_id } = message;
     
-    // Enviar notificación al receptor
-    if (onlineUsers.has(to_user_id)) {
-        const receiver = onlineUsers.get(to_user_id);
-        receiver.ws.send(JSON.stringify({
-            type: 'friend_request',
-            from_user_id: senderId,
-            from_username: senderName,
-            to_user_id: to_user_id,
-            timestamp: Date.now()
-        }));
+    try {
+        // Crear notificación en la base de datos
+        await dbPool.execute(
+            'INSERT INTO chat_notifications (user_id, type, from_user_id) VALUES (?, "friend_request", ?)',
+            [to_user_id, senderId]
+        );
+        
+        // Enviar notificación al receptor si está en línea
+        if (onlineUsers.has(to_user_id)) {
+            const receiver = onlineUsers.get(to_user_id);
+            receiver.ws.send(JSON.stringify({
+                type: 'friend_request',
+                from_user_id: senderId,
+                from_username: senderName,
+                to_user_id: to_user_id,
+                timestamp: Date.now()
+            }));
+        }
+        
+    } catch (error) {
+        console.error('Error enviando solicitud de amistad:', error);
     }
 }
 
 async function handleFriendRequestResponse(userId, username, message) {
     const { request_id, from_user_id, status } = message;
     
-    // Enviar respuesta al solicitante original
-    if (onlineUsers.has(from_user_id)) {
-        const originalSender = onlineUsers.get(from_user_id);
-        originalSender.ws.send(JSON.stringify({
-            type: 'friend_request_response',
-            request_id: request_id,
+    try {
+        // Actualizar estado en la base de datos
+        await dbPool.execute(
+            'UPDATE friends SET status = ?, updated_at = NOW() WHERE user_id = ? AND friend_id = ?',
+            [status, from_user_id, userId]
+        );
+        
+        // Crear notificación si es aceptada
+        if (status === 'accepted') {
+            await dbPool.execute(
+                'INSERT INTO chat_notifications (user_id, type, from_user_id) VALUES (?, "friend_accepted", ?)',
+                [from_user_id, userId]
+            );
+        }
+        
+        // Enviar respuesta al solicitante original si está en línea
+        if (onlineUsers.has(from_user_id)) {
+            const originalSender = onlineUsers.get(from_user_id);
+            originalSender.ws.send(JSON.stringify({
+                type: 'friend_request_response',
+                request_id: request_id,
+                from_user_id: userId,
+                from_username: username,
+                to_user_id: from_user_id,
+                status: status,
+                timestamp: Date.now()
+            }));
+        }
+        
+    } catch (error) {
+        console.error('Error procesando respuesta de solicitud:', error);
+    }
+}
+
+async function handleTypingNotification(userId, username, message) {
+    const { to_user_id, is_typing } = message;
+    
+    // Enviar notificación de "escribiendo..." al receptor si está en línea
+    if (onlineUsers.has(to_user_id)) {
+        const receiver = onlineUsers.get(to_user_id);
+        receiver.ws.send(JSON.stringify({
+            type: 'typing',
             from_user_id: userId,
-            to_user_id: from_user_id,
-            status: status,
+            from_username: username,
+            is_typing: is_typing,
             timestamp: Date.now()
         }));
+    }
+}
+
+async function handleReadReceipt(userId, message) {
+    const { message_id, from_user_id } = message;
+    
+    try {
+        // Marcar mensaje como leído en la base de datos
+        await dbPool.execute(
+            'UPDATE chat_messages SET is_read = TRUE WHERE id = ? AND receiver_id = ?',
+            [message_id, userId]
+        );
+        
+        // Notificar al remitente si está en línea
+        if (onlineUsers.has(from_user_id)) {
+            const sender = onlineUsers.get(from_user_id);
+            sender.ws.send(JSON.stringify({
+                type: 'read_receipt',
+                message_id: message_id,
+                read_by: userId,
+                timestamp: Date.now()
+            }));
+        }
+        
+    } catch (error) {
+        console.error('Error actualizando estado de lectura:', error);
     }
 }
 
@@ -198,6 +292,65 @@ async function updateUserOnlineStatus(userId, isOnline) {
         );
     } catch (error) {
         console.error('Error actualizando estado:', error);
+    }
+}
+
+async function notifyFriendsOnline(userId, username) {
+    try {
+        // Obtener amigos
+        const [friends] = await dbPool.execute(
+            `SELECT u.id 
+             FROM friends f 
+             JOIN users u ON (f.user_id = ? AND f.friend_id = u.id) 
+                OR (f.friend_id = ? AND f.user_id = u.id) 
+             WHERE f.status = 'accepted' AND u.is_online = 1`,
+            [userId, userId]
+        );
+        
+        // Notificar a cada amigo en línea
+        friends.forEach(friend => {
+            if (onlineUsers.has(friend.id)) {
+                const friendWs = onlineUsers.get(friend.id).ws;
+                friendWs.send(JSON.stringify({
+                    type: 'friend_online',
+                    user_id: userId,
+                    username: username,
+                    timestamp: Date.now()
+                }));
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error notificando amigos:', error);
+    }
+}
+
+async function notifyFriendsOffline(userId) {
+    try {
+        // Obtener amigos
+        const [friends] = await dbPool.execute(
+            `SELECT u.id 
+             FROM friends f 
+             JOIN users u ON (f.user_id = ? AND f.friend_id = u.id) 
+                OR (f.friend_id = ? AND f.user_id = u.id) 
+             WHERE f.status = 'accepted' AND u.is_online = 1`,
+            [userId, userId]
+        );
+        
+        // Notificar a cada amigo en línea
+        friends.forEach(friend => {
+            if (onlineUsers.has(friend.id)) {
+                const friendWs = onlineUsers.get(friend.id).ws;
+                friendWs.send(JSON.stringify({
+                    type: 'friend_offline',
+                    user_id: userId,
+                    timestamp: Date.now()
+                }));
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error notificando amigos:', error);
     }
 }
 
@@ -214,18 +367,18 @@ async function sendPendingNotifications(userId, ws) {
             [userId]
         );
         
-        // Obtener solicitudes de amistad pendientes
-        const [pendingRequests] = await dbPool.execute(
-            `SELECT fr.*, u.username as sender_username
-             FROM friends fr
-             JOIN users u ON fr.user_id = u.id
-             WHERE fr.friend_id = ? AND fr.status = 'pending'
-             ORDER BY fr.created_at DESC
+        // Obtener notificaciones no leídas
+        const [notifications] = await dbPool.execute(
+            `SELECT cn.*, u.username as from_username
+             FROM chat_notifications cn
+             LEFT JOIN users u ON cn.from_user_id = u.id
+             WHERE cn.user_id = ? AND cn.is_read = FALSE
+             ORDER BY cn.created_at DESC
              LIMIT 10`,
             [userId]
         );
         
-        // Enviar notificaciones
+        // Enviar mensajes no leídos
         unreadMessages.forEach(msg => {
             ws.send(JSON.stringify({
                 type: 'private_message',
@@ -238,13 +391,15 @@ async function sendPendingNotifications(userId, ws) {
             }));
         });
         
-        pendingRequests.forEach(req => {
+        // Enviar notificaciones
+        notifications.forEach(notif => {
             ws.send(JSON.stringify({
-                type: 'friend_request',
-                from_user_id: req.user_id,
-                from_username: req.sender_username,
-                to_user_id: userId,
-                timestamp: new Date(req.created_at).getTime()
+                type: notif.type,
+                notification_id: notif.id,
+                from_user_id: notif.from_user_id,
+                from_username: notif.from_username,
+                message: notif.message,
+                timestamp: new Date(notif.created_at).getTime()
             }));
         });
         
@@ -264,7 +419,25 @@ setInterval(() => {
     console.log(`👥 Usuarios en línea: ${onlineUsers.size}`);
 }, 60000);
 
-process.on('SIGINT', () => {
+// Manejo de cierre
+process.on('SIGINT', async () => {
     console.log('\n👋 Apagando servidor de chat...');
+    
+    // Marcar todos los usuarios como desconectados
+    for (const userId of onlineUsers.keys()) {
+        await updateUserOnlineStatus(userId, false);
+    }
+    
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.log('\n👋 Apagando servidor de chat...');
+    
+    // Marcar todos los usuarios como desconectados
+    for (const userId of onlineUsers.keys()) {
+        await updateUserOnlineStatus(userId, false);
+    }
+    
     process.exit(0);
 });
