@@ -5,6 +5,11 @@ const mysql = require('mysql2/promise');
 
 // Configuración
 const PORT = process.env.PORT || 10001;
+const ALLOWED_ORIGINS = [
+    'https://gerges-online.xo.je',
+    'http://localhost:3000',
+    'http://localhost'
+];
 
 // Conexión a la base de datos
 const dbPool = mysql.createPool({
@@ -23,11 +28,30 @@ const onlineUsers = new Map(); // userId -> { ws, username, ... }
 const userSockets = new Map(); // userId -> Set of WebSockets
 
 const server = http.createServer((req, res) => {
+    // CORS HEADERS
+    const origin = req.headers.origin;
+    if (ALLOWED_ORIGINS.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+    
     if (req.url === '/health') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, { 
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache, no-store, must-revalidate'
+        });
         res.end(JSON.stringify({ 
             status: 'ok', 
-            online: onlineUsers.size 
+            online: onlineUsers.size,
+            timestamp: new Date().toISOString()
         }));
         return;
     }
@@ -39,7 +63,28 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ 
     server, 
     path: '/chat-ws',
-    perMessageDeflate: false
+    perMessageDeflate: false,
+    verifyClient: (info, callback) => {
+        const origin = info.origin || info.req.headers.origin;
+        const parsedUrl = url.parse(info.req.url, true);
+        const userId = parseInt(parsedUrl.query.user);
+        
+        // Verificar origen
+        if (!ALLOWED_ORIGINS.includes(origin)) {
+            console.log(`❌ Origen no permitido: ${origin}`);
+            callback(false, 403, 'Origen no permitido');
+            return;
+        }
+        
+        // Verificar usuario
+        if (!userId || isNaN(userId)) {
+            console.log(`❌ ID de usuario inválido: ${parsedUrl.query.user}`);
+            callback(false, 400, 'ID de usuario requerido');
+            return;
+        }
+        
+        callback(true);
+    }
 });
 
 wss.on('connection', async (ws, req) => {
