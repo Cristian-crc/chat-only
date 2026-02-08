@@ -19,56 +19,7 @@ const dbPool = new Pool({
 });
 
 // Almacenamiento en memoria
-const onlineUsers = new Map();
-const userSockets = new Map();
-
-// Crear tablas al iniciar
-async function initDatabase() {
-    try {
-        console.log('🔄 Inicializando base de datos PostgreSQL...');
-        
-        // Tabla de mensajes
-        await dbPool.query(`
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id SERIAL PRIMARY KEY,
-                sender_id INTEGER NOT NULL,
-                receiver_id INTEGER NOT NULL,
-                message TEXT NOT NULL,
-                is_read BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-        
-        // Tabla de notificaciones
-        await dbPool.query(`
-            CREATE TABLE IF NOT EXISTS chat_notifications (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                type VARCHAR(50) NOT NULL,
-                from_user_id INTEGER,
-                message TEXT,
-                is_read BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-        
-        // Tabla de usuarios online (opcional, podemos usar solo memoria)
-        await dbPool.query(`
-            CREATE TABLE IF NOT EXISTS online_users_cache (
-                user_id INTEGER PRIMARY KEY,
-                username VARCHAR(100),
-                socket_count INTEGER DEFAULT 1,
-                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-        
-        console.log('✅ Base de datos inicializada correctamente');
-        return true;
-    } catch (error) {
-        console.error('❌ Error inicializando base de datos:', error.message);
-        return false;
-    }
-}
+const onlineUsers = new Map(); // userId -> { ws, username, ... }
 
 const server = http.createServer((req, res) => {
     const origin = req.headers.origin;
@@ -96,14 +47,6 @@ const server = http.createServer((req, res) => {
             timestamp: new Date().toISOString(),
             database: 'postgresql'
         }));
-        return;
-    }
-    
-    if (req.url === '/init-db') {
-        initDatabase().then(result => {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: result }));
-        });
         return;
     }
     
@@ -151,25 +94,6 @@ wss.on('connection', async (ws, req) => {
     // Registrar usuario
     onlineUsers.set(userId, { ws, username, userId });
     
-    if (!userSockets.has(userId)) {
-        userSockets.set(userId, new Set());
-    }
-    userSockets.get(userId).add(ws);
-    
-    // Actualizar cache en PostgreSQL (opcional)
-    try {
-        await dbPool.query(`
-            INSERT INTO online_users_cache (user_id, username) 
-            VALUES ($1, $2) 
-            ON CONFLICT (user_id) 
-            DO UPDATE SET 
-                socket_count = online_users_cache.socket_count + 1,
-                last_seen = CURRENT_TIMESTAMP
-        `, [userId, username]);
-    } catch (error) {
-        console.error('Error actualizando cache:', error.message);
-    }
-    
     // Enviar confirmación
     ws.send(JSON.stringify({
         type: 'connected',
@@ -178,40 +102,13 @@ wss.on('connection', async (ws, req) => {
         timestamp: Date.now()
     }));
     
-    // Enviar notificaciones pendientes
-    try {
-        const result = await dbPool.query(
-            `SELECT * FROM chat_notifications 
-             WHERE user_id = $1 AND is_read = FALSE 
-             ORDER BY created_at DESC 
-             LIMIT 10`,
-            [userId]
-        );
-        
-        result.rows.forEach(notification => {
-            ws.send(JSON.stringify({
-                type: notification.type,
-                notification_id: notification.id,
-                from_user_id: notification.from_user_id,
-                message: notification.message,
-                timestamp: new Date(notification.created_at).getTime()
-            }));
-        });
-        
-        // Marcar como leídas
-        if (result.rows.length > 0) {
-            await dbPool.query(
-                'UPDATE chat_notifications SET is_read = TRUE WHERE user_id = $1',
-                [userId]
-            );
-        }
-    } catch (error) {
-        console.error('Error enviando notificaciones:', error.message);
-    }
+    // Notificar a amigos que están en línea
+    notifyFriendsOnline(userId, username);
     
     ws.on('message', async (data) => {
         try {
             const message = JSON.parse(data.toString());
+            console.log(`📨 Mensaje de ${username} (${userId}):`, message.type);
             await handleMessage(userId, username, message, ws);
         } catch (error) {
             console.error('Error procesando mensaje:', error);
@@ -221,24 +118,11 @@ wss.on('connection', async (ws, req) => {
     ws.on('close', async () => {
         console.log(`👋 Usuario desconectado: ${username} (${userId})`);
         
-        if (userSockets.has(userId)) {
-            userSockets.get(userId).delete(ws);
-            
-            if (userSockets.get(userId).size === 0) {
-                userSockets.delete(userId);
-                onlineUsers.delete(userId);
-                
-                // Remover de cache en PostgreSQL
-                try {
-                    await dbPool.query(
-                        'DELETE FROM online_users_cache WHERE user_id = $1',
-                        [userId]
-                    );
-                } catch (error) {
-                    console.error('Error removiendo de cache:', error.message);
-                }
-            }
-        }
+        // Remover usuario
+        onlineUsers.delete(userId);
+        
+        // Notificar a amigos que está desconectado
+        notifyFriendsOffline(userId);
     });
     
     ws.on('error', (error) => {
@@ -247,8 +131,6 @@ wss.on('connection', async (ws, req) => {
 });
 
 async function handleMessage(userId, username, message, ws) {
-    console.log(`📨 Mensaje recibido de ${username} (${userId}): ${message.type}`);
-    
     switch (message.type) {
         case 'private_message':
             await handlePrivateMessage(userId, username, message);
@@ -274,69 +156,25 @@ async function handleMessage(userId, username, message, ws) {
             ws.send(JSON.stringify({ type: 'pong' }));
             break;
             
-        // AGREGAR ESTOS NUEVOS CASOS:
         case 'user_online':
-            console.log(`👤 Usuario ${userId} (${username}) está en línea`);
-            // Notificar a amigos
-            await notifyFriendsOnline(userId, username);
+            console.log(`👤 Usuario ${username} (${userId}) notifica que está en línea`);
+            notifyFriendsOnline(userId, username);
             break;
             
         case 'user_left':
-            console.log(`👤 Usuario ${userId} (${username}) se desconectó`);
-            // Notificar a amigos
-            await notifyFriendsOffline(userId);
+            console.log(`👤 Usuario ${username} (${userId}) notifica que se desconectó`);
+            notifyFriendsOffline(userId);
             break;
             
         default:
             console.log(`⚠️ Tipo de mensaje no manejado: ${message.type}`);
-            console.log('Mensaje completo:', message);
-    }
-}
-
-async function notifyFriendsOffline(userId) {
-    try {
-        console.log(`📢 Notificando amigos de usuario ${userId} que se desconectó`);
-        
-        onlineUsers.forEach((user, id) => {
-            if (id !== userId && user.ws.readyState === WebSocket.OPEN) {
-                user.ws.send(JSON.stringify({
-                    type: 'friend_offline',
-                    user_id: userId,
-                    timestamp: Date.now()
-                }));
-            }
-        });
-        
-    } catch (error) {
-        console.error('Error notificando amigos offline:', error.message);
-    }
-}
-
-async function notifyFriendsOnline(userId, username) {
-    try {
-        // Aquí deberías notificar a los amigos que el usuario está en línea
-        // Por ahora solo log
-        console.log(`📢 Notificando amigos de ${username} (${userId}) que está en línea`);
-        
-        // En una implementación real, buscarías amigos en línea y les enviarías notificación
-        onlineUsers.forEach((user, id) => {
-            if (id !== userId && user.ws.readyState === WebSocket.OPEN) {
-                user.ws.send(JSON.stringify({
-                    type: 'friend_online',
-                    user_id: userId,
-                    username: username,
-                    timestamp: Date.now()
-                }));
-            }
-        });
-        
-    } catch (error) {
-        console.error('Error notificando amigos:', error.message);
     }
 }
 
 async function handlePrivateMessage(senderId, senderName, message) {
-    const { to_user_id, message: messageText } = message;
+    const { to_user_id, message: messageText, timestamp } = message;
+    
+    console.log(`💬 Mensaje privado de ${senderId} a ${to_user_id}: ${messageText.substring(0, 50)}...`);
     
     try {
         // Guardar en PostgreSQL
@@ -353,9 +191,11 @@ async function handlePrivateMessage(senderId, senderName, message) {
             [to_user_id, 'message', senderId, messageText.substring(0, 100)]
         );
         
-        // Enviar al receptor si está en línea
+        // ENVIAR AL RECEPTOR SI ESTÁ EN LÍNEA - CORREGIDO
         if (onlineUsers.has(to_user_id)) {
             const receiver = onlineUsers.get(to_user_id);
+            console.log(`📤 Enviando mensaje ${messageId} a usuario ${to_user_id} (está en línea)`);
+            
             receiver.ws.send(JSON.stringify({
                 type: 'private_message',
                 from_user_id: senderId,
@@ -363,12 +203,25 @@ async function handlePrivateMessage(senderId, senderName, message) {
                 to_user_id: to_user_id,
                 message: messageText,
                 message_id: messageId,
-                timestamp: Date.now()
+                timestamp: timestamp || Date.now()
+            }));
+        } else {
+            console.log(`📭 Usuario ${to_user_id} no está en línea. Mensaje guardado.`);
+        }
+        
+        // TAMBIÉN ENVIAR CONFIRMACIÓN AL REMITENTE (OPCIONAL)
+        if (onlineUsers.has(senderId)) {
+            const sender = onlineUsers.get(senderId);
+            sender.ws.send(JSON.stringify({
+                type: 'message_sent',
+                message_id: messageId,
+                to_user_id: to_user_id,
+                timestamp: timestamp || Date.now()
             }));
         }
         
     } catch (error) {
-        console.error('Error guardando mensaje:', error.message);
+        console.error('❌ Error guardando mensaje:', error.message);
     }
 }
 
@@ -439,19 +292,127 @@ async function handleFriendRequestResponse(userId, username, message) {
     }
 }
 
+async function handleTypingNotification(userId, username, message) {
+    const { to_user_id, is_typing } = message;
+    
+    console.log(`✍️ ${username} ${is_typing ? 'está escribiendo' : 'dejó de escribir'} a ${to_user_id}`);
+    
+    // Enviar notificación al receptor si está en línea
+    if (onlineUsers.has(to_user_id)) {
+        const receiver = onlineUsers.get(to_user_id);
+        receiver.ws.send(JSON.stringify({
+            type: 'typing',
+            from_user_id: userId,
+            from_username: username,
+            is_typing: is_typing,
+            timestamp: Date.now()
+        }));
+    }
+}
+
+async function handleReadReceipt(userId, message) {
+    const { message_id, from_user_id } = message;
+    
+    try {
+        // Marcar mensaje como leído en PostgreSQL
+        await dbPool.query(
+            'UPDATE chat_messages SET is_read = TRUE WHERE id = $1 AND receiver_id = $2',
+            [message_id, userId]
+        );
+        
+        // Notificar al remitente si está en línea
+        if (onlineUsers.has(from_user_id)) {
+            const sender = onlineUsers.get(from_user_id);
+            sender.ws.send(JSON.stringify({
+                type: 'read_receipt',
+                message_id: message_id,
+                read_by: userId,
+                timestamp: Date.now()
+            }));
+        }
+        
+    } catch (error) {
+        console.error('Error actualizando estado de lectura:', error.message);
+    }
+}
+
+function notifyFriendsOnline(userId, username) {
+    console.log(`📢 Notificando amigos de ${username} (${userId}) que está en línea`);
+    
+    // En una implementación real, aquí buscarías en la base de datos los amigos
+    // Por simplicidad, notificamos a todos los usuarios en línea excepto al mismo
+    onlineUsers.forEach((user, id) => {
+        if (id !== userId && user.ws.readyState === WebSocket.OPEN) {
+            user.ws.send(JSON.stringify({
+                type: 'friend_online',
+                user_id: userId,
+                username: username,
+                timestamp: Date.now()
+            }));
+        }
+    });
+}
+
+function notifyFriendsOffline(userId) {
+    console.log(`📢 Notificando amigos de usuario ${userId} que se desconectó`);
+    
+    onlineUsers.forEach((user, id) => {
+        if (id !== userId && user.ws.readyState === WebSocket.OPEN) {
+            user.ws.send(JSON.stringify({
+                type: 'friend_offline',
+                user_id: userId,
+                timestamp: Date.now()
+            }));
+        }
+    });
+}
+
+// Inicializar base de datos
+async function initDatabase() {
+    try {
+        console.log('🔄 Inicializando base de datos PostgreSQL...');
+        
+        // Tabla de mensajes
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id SERIAL PRIMARY KEY,
+                sender_id INTEGER NOT NULL,
+                receiver_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        
+        // Tabla de notificaciones
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS chat_notifications (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                type VARCHAR(50) NOT NULL,
+                from_user_id INTEGER,
+                message TEXT,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        
+        console.log('✅ Base de datos inicializada correctamente');
+        return true;
+    } catch (error) {
+        console.error('❌ Error inicializando base de datos:', error.message);
+        return false;
+    }
+}
+
 // Inicializar base de datos al arrancar
 async function startServer() {
-    const dbInitialized = await initDatabase();
-    
-    if (!dbInitialized) {
-        console.warn('⚠️  Base de datos no inicializada, pero el servidor continuará');
-    }
+    await initDatabase();
     
     server.listen(PORT, () => {
         console.log(`💬 Servidor de chat PostgreSQL en puerto ${PORT}`);
-        console.log(`🔗 WebSocket: ws://localhost:${PORT}/chat-ws`);
+        console.log(`🔗 WebSocket: wss://localhost:${PORT}/chat-ws`);
         console.log(`🏥 Health check: http://localhost:${PORT}/health`);
-        console.log(`🗄️  Init DB: http://localhost:${PORT}/init-db`);
         console.log(`👥 Usuarios permitidos: ${ALLOWED_ORIGINS.join(', ')}`);
     });
 }
@@ -463,22 +424,9 @@ startServer().catch(error => {
 });
 
 // Limpieza periódica (cada 5 minutos)
-setInterval(async () => {
+setInterval(() => {
     console.log(`👥 Usuarios en línea: ${onlineUsers.size}`);
-    
-    try {
-        // Limpiar usuarios que no han estado activos en 15 minutos
-        await dbPool.query(
-            `DELETE FROM online_users_cache 
-             WHERE last_seen < CURRENT_TIMESTAMP - INTERVAL '15 minutes'`
-        );
-    } catch (error) {
-        // Si la tabla no existe, solo ignorar el error
-        if (error.code !== '42P01') { // 42P01 = tabla no existe
-            console.error('Error limpiando cache:', error.message);
-        }
-    }
-}, 300000); // 5 minutos
+}, 300000);
 
 // Manejo de cierre
 process.on('SIGINT', async () => {
