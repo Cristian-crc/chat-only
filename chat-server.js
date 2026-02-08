@@ -9,7 +9,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS ?
     process.env.ALLOWED_ORIGINS.split(',') : 
     ['https://gerges-online.xo.je', 'http://localhost:3000', 'http://localhost'];
 
-// Conexión a PostgreSQL en Render
+// Conexión a PostgreSQL en Render (SOLO para mensajes y notificaciones)
 const dbPool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
@@ -18,8 +18,8 @@ const dbPool = new Pool({
     connectionTimeoutMillis: 2000,
 });
 
-// Almacenamiento en memoria
-const onlineUsers = new Map(); // userId -> { ws, username, ... }
+// Almacenamiento en memoria para usuarios en línea
+const onlineUsers = new Map(); // userId -> { ws, username, connectionType, timestamp }
 
 const server = http.createServer((req, res) => {
     const origin = req.headers.origin;
@@ -41,34 +41,36 @@ const server = http.createServer((req, res) => {
             'Content-Type': 'application/json',
             'Cache-Control': 'no-cache, no-store, must-revalidate'
         });
+        
+        // Obtener usuarios activos (últimos 5 minutos)
+        const now = Date.now();
+        const activeUsers = Array.from(onlineUsers.entries())
+            .filter(([_, user]) => (now - user.timestamp) < 300000) // 5 minutos
+            .map(([id, user]) => ({ id, username: user.username }));
+        
         res.end(JSON.stringify({ 
             status: 'ok', 
-            online: onlineUsers.size,
+            online: activeUsers.length,
+            active_users: activeUsers,
             timestamp: new Date().toISOString(),
             database: 'postgresql'
         }));
         return;
     }
     
-    // Nuevo endpoint para obtener amigos en línea
-    if (req.url.startsWith('/friends/online/')) {
+    // Endpoint para verificar si un usuario está en línea
+    if (req.url.startsWith('/check-online/')) {
         const userId = req.url.split('/').pop();
-        if (userId) {
-            getOnlineFriendsFromDB(parseInt(userId)).then(friends => {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                    success: true, 
-                    online_friends: friends 
-                }));
-            }).catch(error => {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ 
-                    success: false, 
-                    error: error.message 
-                }));
-            });
-            return;
-        }
+        const isOnline = onlineUsers.has(parseInt(userId));
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+            success: true, 
+            user_id: parseInt(userId),
+            is_online: isOnline,
+            timestamp: Date.now()
+        }));
+        return;
     }
     
     res.writeHead(404);
@@ -100,96 +102,40 @@ const wss = new WebSocket.Server({
     }
 });
 
-// Función para obtener amigos de un usuario desde la base de datos
-async function getFriendsFromDB(userId) {
+// Función para obtener amigos de un usuario (solo IDs, no consulta la tabla users)
+async function getFriendIds(userId) {
     try {
+        // Esta consulta asume que tienes una tabla 'friends' en tu base de datos de chat
+        // Si no la tienes, la crearemos en initDatabase()
         const result = await dbPool.query(`
-            SELECT u.id, u.username, u.avatar_color,
-                   CASE 
-                        WHEN u.last_seen >= NOW() - INTERVAL '2 minutes' THEN true
-                        ELSE false
-                   END as is_online
-            FROM (
-                SELECT friend_id as id FROM friends WHERE user_id = $1 AND status = 'accepted'
-                UNION
-                SELECT user_id as id FROM friends WHERE friend_id = $1 AND status = 'accepted'
-            ) f
-            JOIN users u ON f.id = u.id
-            ORDER BY u.username
+            SELECT 
+                CASE 
+                    WHEN user_id = $1 THEN friend_id
+                    ELSE user_id
+                END as friend_id
+            FROM friends 
+            WHERE (user_id = $1 OR friend_id = $1) 
+            AND status = 'accepted'
         `, [userId]);
         
-        return result.rows;
+        return result.rows.map(row => row.friend_id);
     } catch (error) {
-        console.error('Error obteniendo amigos:', error.message);
+        console.error('Error obteniendo IDs de amigos:', error.message);
+        // Si falla, devolver array vacío
         return [];
-    }
-}
-
-// Función para obtener amigos en línea desde la base de datos
-async function getOnlineFriendsFromDB(userId) {
-    try {
-        const result = await dbPool.query(`
-            SELECT u.id, u.username, u.avatar_color
-            FROM (
-                SELECT friend_id as id FROM friends WHERE user_id = $1 AND status = 'accepted'
-                UNION
-                SELECT user_id as id FROM friends WHERE friend_id = $1 AND status = 'accepted'
-            ) f
-            JOIN users u ON f.id = u.id
-            WHERE u.last_seen >= NOW() - INTERVAL '2 minutes'
-            ORDER BY u.username
-        `, [userId]);
-        
-        return result.rows;
-    } catch (error) {
-        console.error('Error obteniendo amigos en línea:', error.message);
-        return [];
-    }
-}
-
-// Función para verificar si dos usuarios son amigos
-async function areFriends(userId1, userId2) {
-    try {
-        const result = await dbPool.query(`
-            SELECT 1 FROM friends 
-            WHERE (
-                (user_id = $1 AND friend_id = $2) 
-                OR (user_id = $2 AND friend_id = $1)
-            ) AND status = 'accepted'
-            LIMIT 1
-        `, [userId1, userId2]);
-        
-        return result.rows.length > 0;
-    } catch (error) {
-        console.error('Error verificando amistad:', error.message);
-        return false;
-    }
-}
-
-// Función para actualizar estado de usuario en la base de datos
-async function updateUserStatus(userId, isOnline) {
-    try {
-        if (isOnline) {
-            await dbPool.query(
-                'UPDATE users SET is_online = true, last_seen = NOW() WHERE id = $1',
-                [userId]
-            );
-        } else {
-            await dbPool.query(
-                'UPDATE users SET is_online = false, last_seen = NOW() WHERE id = $1',
-                [userId]
-            );
-        }
-    } catch (error) {
-        console.error('Error actualizando estado de usuario:', error.message);
     }
 }
 
 // Función para notificar a amigos específicos
 async function notifySpecificFriends(userId, username, isOnline) {
     try {
-        // Obtener amigos desde la base de datos
-        const friends = await getFriendsFromDB(userId);
+        // Obtener IDs de amigos
+        const friendIds = await getFriendIds(userId);
+        
+        if (friendIds.length === 0) {
+            console.log(`📢 Usuario ${username} (${userId}) no tiene amigos registrados`);
+            return;
+        }
         
         // Preparar notificación
         const notification = {
@@ -199,16 +145,21 @@ async function notifySpecificFriends(userId, username, isOnline) {
             timestamp: Date.now()
         };
         
+        let notifiedCount = 0;
+        
         // Enviar notificación a amigos que estén conectados al WebSocket
-        for (const friend of friends) {
-            if (onlineUsers.has(friend.id)) {
-                const friendWs = onlineUsers.get(friend.id).ws;
-                if (friendWs.readyState === WebSocket.OPEN) {
-                    friendWs.send(JSON.stringify(notification));
-                    console.log(`📢 Notificación enviada a ${friend.username} (${friend.id}): ${username} está ${isOnline ? 'en línea' : 'desconectado'}`);
+        for (const friendId of friendIds) {
+            if (onlineUsers.has(friendId)) {
+                const friend = onlineUsers.get(friendId);
+                if (friend.ws.readyState === WebSocket.OPEN) {
+                    friend.ws.send(JSON.stringify(notification));
+                    notifiedCount++;
                 }
             }
         }
+        
+        console.log(`📢 Notificaciones enviadas: ${notifiedCount}/${friendIds.length} amigos de ${username} (${userId})`);
+        
     } catch (error) {
         console.error('Error notificando a amigos:', error.message);
     }
@@ -217,21 +168,32 @@ async function notifySpecificFriends(userId, username, isOnline) {
 // Función para enviar lista de amigos en línea al usuario conectado
 async function sendOnlineFriendsList(userId, ws) {
     try {
-        const onlineFriends = await getOnlineFriendsFromDB(userId);
+        // Obtener IDs de amigos
+        const friendIds = await getFriendIds(userId);
+        
+        if (friendIds.length === 0) {
+            console.log(`📋 Usuario ${userId} no tiene amigos, no se envía lista`);
+            return;
+        }
+        
+        let sentCount = 0;
         
         // Enviar cada amigo en línea como notificación individual
-        for (const friend of onlineFriends) {
-            if (friend.id !== userId) { // No enviarse a sí mismo
+        for (const friendId of friendIds) {
+            if (onlineUsers.has(friendId)) {
+                const friend = onlineUsers.get(friendId);
                 ws.send(JSON.stringify({
                     type: 'friend_online',
-                    user_id: friend.id,
+                    user_id: friendId,
                     username: friend.username,
                     timestamp: Date.now()
                 }));
+                sentCount++;
             }
         }
         
-        console.log(`📋 Enviada lista de ${onlineFriends.length} amigos en línea a usuario ${userId}`);
+        console.log(`📋 Enviada lista de ${sentCount}/${friendIds.length} amigos en línea a usuario ${userId}`);
+        
     } catch (error) {
         console.error('Error enviando lista de amigos en línea:', error.message);
     }
@@ -250,11 +212,14 @@ wss.on('connection', async (ws, req) => {
     
     console.log(`🔌 ${connectionType.toUpperCase()} - Usuario conectado: ${username} (${userId})`);
     
-    // Registrar usuario
-    onlineUsers.set(userId, { ws, username, userId, connectionType });
-    
-    // Actualizar estado en la base de datos
-    await updateUserStatus(userId, true);
+    // Registrar usuario en memoria
+    onlineUsers.set(userId, { 
+        ws, 
+        username, 
+        userId, 
+        connectionType,
+        timestamp: Date.now() // Para tracking de actividad
+    });
     
     // Enviar confirmación
     ws.send(JSON.stringify({
@@ -273,11 +238,30 @@ wss.on('connection', async (ws, req) => {
         await sendOnlineFriendsList(userId, ws);
     }
     
+    // Heartbeat para mantener la conexión activa
+    const heartbeatInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.ping();
+            
+            // Actualizar timestamp de actividad
+            if (onlineUsers.has(userId)) {
+                const user = onlineUsers.get(userId);
+                user.timestamp = Date.now();
+            }
+        }
+    }, 30000); // Cada 30 segundos
+    
     ws.on('message', async (data) => {
         try {
             const message = JSON.parse(data.toString());
             console.log(`📨 Mensaje de ${username} (${userId}):`, message.type);
             await handleMessage(userId, username, message, ws);
+            
+            // Actualizar timestamp de actividad cuando envía mensajes
+            if (onlineUsers.has(userId)) {
+                const user = onlineUsers.get(userId);
+                user.timestamp = Date.now();
+            }
         } catch (error) {
             console.error('Error procesando mensaje:', error);
         }
@@ -286,11 +270,11 @@ wss.on('connection', async (ws, req) => {
     ws.on('close', async () => {
         console.log(`👋 ${connectionType.toUpperCase()} - Usuario desconectado: ${username} (${userId})`);
         
-        // Remover usuario
-        onlineUsers.delete(userId);
+        // Limpiar intervalo de heartbeat
+        clearInterval(heartbeatInterval);
         
-        // Actualizar estado en la base de datos
-        await updateUserStatus(userId, false);
+        // Remover usuario de memoria
+        onlineUsers.delete(userId);
         
         // Notificar a amigos específicos que está desconectado
         await notifySpecificFriends(userId, username, false);
@@ -298,6 +282,15 @@ wss.on('connection', async (ws, req) => {
     
     ws.on('error', (error) => {
         console.error(`Error en WebSocket de ${username}:`, error);
+        clearInterval(heartbeatInterval);
+    });
+    
+    // Manejar ping/pong para mantener conexión
+    ws.on('pong', () => {
+        if (onlineUsers.has(userId)) {
+            const user = onlineUsers.get(userId);
+            user.timestamp = Date.now();
+        }
     });
 });
 
@@ -333,13 +326,11 @@ async function handleMessage(userId, username, message, ws) {
             
         case 'user_online':
             console.log(`👤 Usuario ${username} (${userId}) notifica que está en línea`);
-            await updateUserStatus(userId, true);
             await notifySpecificFriends(userId, username, true);
             break;
             
         case 'user_left':
             console.log(`👤 Usuario ${username} (${userId}) notifica que se desconectó`);
-            await updateUserStatus(userId, false);
             await notifySpecificFriends(userId, username, false);
             break;
             
@@ -354,24 +345,6 @@ async function handlePrivateMessage(senderId, senderName, message) {
     console.log(`💬 Mensaje privado de ${senderId} a ${to_user_id}: ${messageText.substring(0, 50)}...`);
     
     try {
-        // Verificar si son amigos
-        const areTheyFriends = await areFriends(senderId, to_user_id);
-        
-        if (!areTheyFriends) {
-            console.log(`❌ ${senderId} y ${to_user_id} no son amigos. Mensaje rechazado.`);
-            
-            // Notificar al remitente
-            if (onlineUsers.has(senderId)) {
-                const sender = onlineUsers.get(senderId);
-                sender.ws.send(JSON.stringify({
-                    type: 'error',
-                    message: 'No puedes enviar mensajes a este usuario porque no son amigos',
-                    timestamp: Date.now()
-                }));
-            }
-            return;
-        }
-        
         // Guardar en PostgreSQL
         const result = await dbPool.query(
             'INSERT INTO chat_messages (sender_id, receiver_id, message) VALUES ($1, $2, $3) RETURNING id, created_at',
@@ -437,13 +410,7 @@ async function handleFriendRequest(senderId, senderName, message) {
     const { to_user_id } = message;
     
     try {
-        // Verificar si ya son amigos
-        const alreadyFriends = await areFriends(senderId, to_user_id);
-        
-        if (alreadyFriends) {
-            console.log(`❌ ${senderId} y ${to_user_id} ya son amigos. Solicitud rechazada.`);
-            return;
-        }
+        // Verificar si ya son amigos (opcional, puede omitirse si no hay tabla friends)
         
         // Crear notificación
         await dbPool.query(
@@ -496,34 +463,28 @@ async function handleFriendRequestResponse(userId, username, message) {
             
             // Notificar al otro usuario
             if (onlineUsers.has(to_user_id)) {
+                // Obtener username del usuario que aceptó
+                const user2 = onlineUsers.get(to_user_id) || { username: 'Usuario' };
                 onlineUsers.get(to_user_id).ws.send(JSON.stringify({
                     ...friendNotification,
                     friend_id: to_user_id
                 }));
-            }
-            
-            // Notificar a ambos que están en línea (si es que están conectados)
-            if (onlineUsers.has(userId) && onlineUsers.has(to_user_id)) {
-                // Notificar al usuario 1 que el usuario 2 está en línea
-                onlineUsers.get(userId).ws.send(JSON.stringify({
-                    type: 'friend_online',
-                    user_id: to_user_id,
-                    username: username,
-                    timestamp: Date.now()
-                }));
                 
-                // Notificar al usuario 2 que el usuario 1 está en línea
-                // Necesitamos obtener el nombre del usuario 2
-                const user2 = await dbPool.query(
-                    'SELECT username FROM users WHERE id = $1',
-                    [to_user_id]
-                );
-                
-                if (user2.rows.length > 0) {
+                // Notificar estado en línea mutuo
+                if (onlineUsers.has(userId)) {
+                    // Notificar al usuario 2 que el usuario 1 está en línea
                     onlineUsers.get(to_user_id).ws.send(JSON.stringify({
                         type: 'friend_online',
                         user_id: userId,
-                        username: user2.rows[0].username,
+                        username: username,
+                        timestamp: Date.now()
+                    }));
+                    
+                    // Notificar al usuario 1 que el usuario 2 está en línea
+                    onlineUsers.get(userId).ws.send(JSON.stringify({
+                        type: 'friend_online',
+                        user_id: to_user_id,
+                        username: user2.username,
                         timestamp: Date.now()
                     }));
                 }
@@ -609,25 +570,17 @@ async function initDatabase() {
             );
         `);
         
-        // Asegurarse de que la tabla users tenga las columnas necesarias
+        // Tabla de amigos (opcional, solo si la vas a usar)
         await dbPool.query(`
-            DO $$ 
-            BEGIN 
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                              WHERE table_name = 'users' AND column_name = 'is_online') THEN
-                    ALTER TABLE users ADD COLUMN is_online BOOLEAN DEFAULT FALSE;
-                END IF;
-                
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                              WHERE table_name = 'users' AND column_name = 'last_seen') THEN
-                    ALTER TABLE users ADD COLUMN last_seen TIMESTAMP DEFAULT NOW();
-                END IF;
-                
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                              WHERE table_name = 'users' AND column_name = 'avatar_color') THEN
-                    ALTER TABLE users ADD COLUMN avatar_color VARCHAR(7) DEFAULT '#FF3333';
-                END IF;
-            END $$;
+            CREATE TABLE IF NOT EXISTS friends (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                friend_id INTEGER NOT NULL,
+                status VARCHAR(20) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, friend_id)
+            );
         `);
         
         console.log('✅ Base de datos inicializada correctamente');
@@ -656,33 +609,39 @@ startServer().catch(error => {
     process.exit(1);
 });
 
-// Limpieza periódica (cada 5 minutos)
+// Limpieza periódica (cada 5 minutos) - limpiar solo usuarios inactivos en memoria
 setInterval(() => {
     console.log(`👥 Usuarios en línea: ${onlineUsers.size}`);
     
-    // Limpiar usuarios inactivos en la base de datos (más de 5 minutos)
-    dbPool.query(
-        "UPDATE users SET is_online = false WHERE last_seen < NOW() - INTERVAL '5 minutes' AND is_online = true"
-    ).catch(err => console.error('Error limpiando usuarios inactivos:', err.message));
-}, 300000);
+    // Limpiar usuarios inactivos (más de 10 minutos sin actividad)
+    const now = Date.now();
+    let cleanedCount = 0;
+    
+    onlineUsers.forEach((user, userId) => {
+        if ((now - user.timestamp) > 600000) { // 10 minutos
+            console.log(`🧹 Limpiando usuario inactivo: ${user.username} (${userId})`);
+            onlineUsers.delete(userId);
+            
+            // Notificar amigos que se desconectó
+            notifySpecificFriends(userId, user.username, false).catch(() => {});
+            cleanedCount++;
+        }
+    });
+    
+    if (cleanedCount > 0) {
+        console.log(`🧹 Se limpiaron ${cleanedCount} usuarios inactivos`);
+    }
+}, 300000); // Cada 5 minutos
 
 // Manejo de cierre
 process.on('SIGINT', async () => {
     console.log('\n👋 Apagando servidor de chat...');
-    
-    // Marcar a todos los usuarios como desconectados
-    await dbPool.query("UPDATE users SET is_online = false WHERE is_online = true");
-    
     await dbPool.end();
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
     console.log('\n👋 Apagando servidor de chat...');
-    
-    // Marcar a todos los usuarios como desconectados
-    await dbPool.query("UPDATE users SET is_online = false WHERE is_online = true");
-    
     await dbPool.end();
     process.exit(0);
 });
