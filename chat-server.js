@@ -247,6 +247,8 @@ wss.on('connection', async (ws, req) => {
 });
 
 async function handleMessage(userId, username, message, ws) {
+    console.log(`📨 Mensaje recibido de ${username} (${userId}): ${message.type}`);
+    
     switch (message.type) {
         case 'private_message':
             await handlePrivateMessage(userId, username, message);
@@ -260,12 +262,76 @@ async function handleMessage(userId, username, message, ws) {
             await handleFriendRequestResponse(userId, username, message);
             break;
             
+        case 'typing':
+            await handleTypingNotification(userId, username, message);
+            break;
+            
+        case 'read_receipt':
+            await handleReadReceipt(userId, message);
+            break;
+            
         case 'ping':
             ws.send(JSON.stringify({ type: 'pong' }));
             break;
             
+        // AGREGAR ESTOS NUEVOS CASOS:
+        case 'user_online':
+            console.log(`👤 Usuario ${userId} (${username}) está en línea`);
+            // Notificar a amigos
+            await notifyFriendsOnline(userId, username);
+            break;
+            
+        case 'user_left':
+            console.log(`👤 Usuario ${userId} (${username}) se desconectó`);
+            // Notificar a amigos
+            await notifyFriendsOffline(userId);
+            break;
+            
         default:
-            console.log(`Tipo de mensaje no manejado: ${message.type}`);
+            console.log(`⚠️ Tipo de mensaje no manejado: ${message.type}`);
+            console.log('Mensaje completo:', message);
+    }
+}
+
+async function notifyFriendsOffline(userId) {
+    try {
+        console.log(`📢 Notificando amigos de usuario ${userId} que se desconectó`);
+        
+        onlineUsers.forEach((user, id) => {
+            if (id !== userId && user.ws.readyState === WebSocket.OPEN) {
+                user.ws.send(JSON.stringify({
+                    type: 'friend_offline',
+                    user_id: userId,
+                    timestamp: Date.now()
+                }));
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error notificando amigos offline:', error.message);
+    }
+}
+
+async function notifyFriendsOnline(userId, username) {
+    try {
+        // Aquí deberías notificar a los amigos que el usuario está en línea
+        // Por ahora solo log
+        console.log(`📢 Notificando amigos de ${username} (${userId}) que está en línea`);
+        
+        // En una implementación real, buscarías amigos en línea y les enviarías notificación
+        onlineUsers.forEach((user, id) => {
+            if (id !== userId && user.ws.readyState === WebSocket.OPEN) {
+                user.ws.send(JSON.stringify({
+                    type: 'friend_online',
+                    user_id: userId,
+                    username: username,
+                    timestamp: Date.now()
+                }));
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error notificando amigos:', error.message);
     }
 }
 
